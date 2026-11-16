@@ -1,0 +1,7 @@
+{
+  "name": "kokoro-speech-job",
+  "private": true,
+  "type": "module",
+  "description": "CPU speech generation with Kokoro-82M (ONNX, via kokoro-js, Apache-2.0). Runs in GitHub Actions; nothing here is deployed.",
+  "dependencies": { "kokoro-js": "1.2.1" }
+}
