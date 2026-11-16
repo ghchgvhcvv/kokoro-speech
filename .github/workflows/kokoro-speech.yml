@@ -1,0 +1,98 @@
+# Kokoro-82M speech generation on a standard GitHub-hosted Ubuntu runner (CPU only, no GPU).
+# The app's Worker dispatches this workflow with a unique job id; the audio goes back to the app as a SHORT-LIVED artifact
+# (retention 1 day, the shortest GitHub allows) which the Worker downloads and then deletes. Nothing is stored in R2, KV, D1 or any other service.
+name: Kokoro speech
+run-name: kokoro-${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Unique job id (8-64 letters, digits, - or _)'
+        required: true
+        type: string
+      request:
+        description: 'JSON: { job, lines: [{ id, voice, text, speed, gain, pause, lead, emotion }] }'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# a retried dispatch of the same job waits for (and never doubles) the first one
+concurrency:
+  group: kokoro-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  speak:
+    name: Speak
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      WORK: ${{ github.workspace }}/.kokoro-work
+      KOKORO_CACHE: ${{ github.workspace }}/.kokoro-model-cache
+    steps:
+      - name: Validate the job id
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          if ! [[ "$JOB_ID" =~ ^[A-Za-z0-9_-]{8,64}$ ]]; then echo "::error title=Kokoro::bad job id"; exit 1; fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache npm downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: kokoro-npm-${{ hashFiles('tools/kokoro/package.json') }}
+
+      - name: Cache the Kokoro model files
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.KOKORO_CACHE }}
+          key: kokoro-82m-v1.0-q8-1
+
+      - name: Install
+        working-directory: tools/kokoro
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Write the request
+        env:
+          REQUEST: ${{ inputs.request }}
+        run: |
+          mkdir -p "$WORK/out"
+          printf '%s' "$REQUEST" > "$WORK/request.json"
+
+      - name: Initialise Kokoro and generate the speech
+        working-directory: tools/kokoro
+        env:
+          KOKORO_DTYPE: q8
+        run: |
+          set +e
+          node generate.mjs "$WORK/request.json" "$WORK/out" 2> "$WORK/err.txt" | tee "$WORK/result.json"
+          code=${PIPESTATUS[0]}; cat "$WORK/err.txt" >&2
+          if [ "$code" != "0" ]; then
+            msg=$(grep -m1 KOKORO_ERROR "$WORK/err.txt" | cut -c1-300)
+            echo "::error title=Kokoro::${msg:-generation failed}"
+            exit "$code"
+          fi
+          { echo '### Kokoro timings'; echo '```json'; cat "$WORK/result.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package the audio as a one-day transfer artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: speech-${{ inputs.job_id }}
+          path: ${{ env.WORK }}/out
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Remove the audio from the runner
+        if: always()
+        run: rm -rf "$WORK" "$KOKORO_CACHE/../.kokoro-tmp" || true
